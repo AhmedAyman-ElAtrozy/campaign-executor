@@ -1,5 +1,5 @@
-// Command executor wires together config, the registry, and the
-// campaign-executor.execute consumer, then runs until shutdown.
+// Command executor wires together config, the registry, the producer,
+// and the execute/audience consumers, then runs them until shutdown.
 package main
 
 import (
@@ -9,10 +9,15 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"campaign-executor/internal/audience"
 	"campaign-executor/internal/command"
 	"campaign-executor/internal/config"
+	"campaign-executor/internal/producer"
 	"campaign-executor/internal/registry"
+
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -22,18 +27,40 @@ func main() {
 		os.Exit(1)
 	}
 
-	reg := registry.New(cfg.RedisAddr)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	consumer := command.New(brokers, cfg.KafkaExecuteTopic, reg)
+
+	reg := registry.New(cfg.RedisAddr)
+	prod := producer.New(brokers, cfg.KafkaOutboundTopic, cfg.KafkaDeadletterTopic)
+
+	cmdConsumer := command.New(brokers, cfg.KafkaExecuteTopic, reg)
+	grace := time.Duration(cfg.AudienceGracePeriodSeconds) * time.Second
+	audConsumer := audience.New(brokers, cfg.KafkaAudienceTopic, reg, prod, grace)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("executor: starting command consumer",
-		"topic", cfg.KafkaExecuteTopic,
+	slog.Info("executor: starting consumers",
+		"executeTopic", cfg.KafkaExecuteTopic,
+		"audienceTopic", cfg.KafkaAudienceTopic,
 		"brokers", cfg.KafkaBrokers)
 
-	err = consumer.Run(ctx)
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		err := cmdConsumer.Run(groupCtx)
+		slog.Info("executor: command consumer stopped", "error", err)
+		return err
+	})
+	group.Go(func() error {
+		err := audConsumer.Run(groupCtx)
+		slog.Info("executor: audience consumer stopped", "error", err)
+		return err
+	})
 
-	slog.Info("executor: command consumer stopped", "error", err)
+	err = group.Wait()
+
+	if closeErr := prod.Close(); closeErr != nil {
+		slog.Error("executor: producer close failed", "error", closeErr)
+	}
+
+	slog.Info("executor: shutdown complete", "error", err)
 }

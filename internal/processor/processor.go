@@ -50,7 +50,7 @@ func Process(record AudienceRecord, hardStopAt time.Time) (*NotificationRequest,
 	}
 	// If a phone number was given, it must be a valid Egyptian mobile number.
 	if record.MSISDN != "" && !e164EG.MatchString(record.MSISDN) {
-		return nil, fmt.Errorf("processor: msisdn %q for customer %s is not valid E.164", record.MSISDN, record.CustomerID)
+		return nil, fmt.Errorf("processor: msisdn %q for customer %s is not valid Egyptian number", record.MSISDN, record.CustomerID)
 	}
 	return &NotificationRequest{
 		IdempotencyKey: buildIdempotencyKey(record.CampaignID, record.CustomerID),

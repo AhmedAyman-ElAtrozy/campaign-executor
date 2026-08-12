@@ -5,6 +5,7 @@ go 1.26.5
 require (
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/segmentio/kafka-go v0.4.51
+	golang.org/x/sync v0.22.0
 )
 
 require (
