@@ -14,9 +14,11 @@ import (
 	"campaign-executor/internal/audience"
 	"campaign-executor/internal/command"
 	"campaign-executor/internal/config"
+	"campaign-executor/internal/httpapi"
 	"campaign-executor/internal/producer"
 	"campaign-executor/internal/registry"
 
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -36,6 +38,9 @@ func main() {
 	grace := time.Duration(cfg.AudienceGracePeriodSeconds) * time.Second
 	audConsumer := audience.New(brokers, cfg.KafkaAudienceTopic, reg, prod, grace)
 
+	redisClient := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	server := httpapi.New(cfg.HTTPPort, reg, redisClient, brokers)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -53,6 +58,11 @@ func main() {
 	group.Go(func() error {
 		err := audConsumer.Run(groupCtx)
 		slog.Info("executor: audience consumer stopped", "error", err)
+		return err
+	})
+	group.Go(func() error {
+		err := server.Run(groupCtx)
+		slog.Info("executor: http server stopped", "error", err)
 		return err
 	})
 

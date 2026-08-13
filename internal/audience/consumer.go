@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"time"
 
+	"campaign-executor/internal/metrics"
 	"campaign-executor/internal/processor"
 	"campaign-executor/internal/producer"
 	"campaign-executor/internal/registry"
@@ -83,13 +84,16 @@ func (c *Consumer) Run(ctx context.Context) error {
 			continue
 		}
 
+		waitStart := time.Now()
 		state, err := c.reg.WaitFor(ctx, record.CampaignID, c.grace)
+		metrics.RegistryWaitSeconds.Observe(time.Since(waitStart).Seconds())
 		if err != nil {
 			c.deadletter(ctx, msg, record.CampaignID, "unknown_campaign")
 			continue
 		}
 
 		if time.Now().After(state.HardStopAt) {
+			metrics.RecordsProcessed.WithLabelValues("skipped").Inc()
 			slog.Info("audience: skipped past hard stop",
 				"campaignId", record.CampaignID,
 				"customerId", record.CustomerID)
@@ -121,6 +125,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 			continue
 		}
 
+		metrics.RecordsProcessed.WithLabelValues("ok").Inc()
 		slog.Info("audience: notification sent",
 			"campaignId", record.CampaignID,
 			"customerId", record.CustomerID)
@@ -144,5 +149,7 @@ func (c *Consumer) deadletter(ctx context.Context, msg kafka.Message, campaignID
 		slog.Error("audience: send deadletter failed",
 			"campaignId", campaignID,
 			"error", err)
+		return
 	}
+	metrics.RecordsProcessed.WithLabelValues("deadletter").Inc()
 }
