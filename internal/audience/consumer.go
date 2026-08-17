@@ -88,7 +88,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 		state, err := c.reg.WaitFor(ctx, record.CampaignID, c.grace)
 		metrics.RegistryWaitSeconds.Observe(time.Since(waitStart).Seconds())
 		if err != nil {
-			c.deadletter(ctx, msg, record.CampaignID, "unknown_campaign")
+			c.deadletter(msg, record.CampaignID, "unknown_campaign")
 			continue
 		}
 
@@ -113,16 +113,22 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 		req, err := processor.Process(procRecord, state.HardStopAt)
 		if err != nil {
-			c.deadletter(ctx, msg, record.CampaignID, err.Error())
+			c.deadletter(msg, record.CampaignID, err.Error())
 			continue
 		}
 
-		if err := c.prod.SendNotification(ctx, req); err != nil {
+		// Use an independent, short-lived context for this last-chance write
+		// so a record that is mid-flight at shutdown can still be produced
+		// or deadlettered instead of being dropped with "context canceled".
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = c.prod.SendNotification(sendCtx, req)
+		sendCancel()
+		if err != nil {
 			slog.Error("audience: send notification failed",
 				"campaignId", record.CampaignID,
 				"customerId", record.CustomerID,
 				"error", err)
-			c.deadletter(ctx, msg, record.CampaignID, "send_notification_failed: "+err.Error())
+			c.deadletter(msg, record.CampaignID, "send_notification_failed: "+err.Error())
 			continue
 		}
 
@@ -134,8 +140,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 }
 
 // deadletter builds and sends a DeadLetter for a record that failed
-// before or during processing, logging if the send itself fails.
-func (c *Consumer) deadletter(ctx context.Context, msg kafka.Message, campaignID, lastError string) {
+// before or during processing, logging if the send itself fails. It uses
+// an independent, short-lived context (rather than Run's ctx) so this
+// last-chance write can still complete even if shutdown has already
+// cancelled the main context.
+func (c *Consumer) deadletter(msg kafka.Message, campaignID, lastError string) {
 	dl := producer.DeadLetter{
 		CampaignID:        campaignID,
 		OriginalTopic:     msg.Topic,
@@ -146,7 +155,9 @@ func (c *Consumer) deadletter(ctx context.Context, msg kafka.Message, campaignID
 		FailedAt:          time.Now(),
 		Snapshot:          msg.Value,
 	}
-	if err := c.prod.SendDeadLetter(ctx, dl); err != nil {
+	sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.prod.SendDeadLetter(sendCtx, dl); err != nil {
 		slog.Error("audience: send deadletter failed",
 			"campaignId", campaignID,
 			"error", err)

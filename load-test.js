@@ -9,18 +9,18 @@ const producer = new Writer({
 const schemaRegistry = new SchemaRegistry();
 
 export const options = {
-  vus: 1,
-  iterations: 10,
+  vus: 10,
+  iterations: 2000,
 };
 
 export default function () {
-  const customerId = `cust_race_${__ITER}`;
+  const customerId = `cust_sdfinal2_${__VU}_${__ITER}`;
   const message = {
     eventType: "AUDIENCE_RECORD",
-    campaignId: "cmp_race_test",
+    campaignId: "cmp_sdfinal2",
     customerId: customerId,
     msisdn: "+201012345678",
-    email: "race@example.com",
+    email: "shutdown@example.com",
     language: "ar-EG",
     attributes: {}
   };
