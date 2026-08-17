@@ -122,6 +122,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 				"campaignId", record.CampaignID,
 				"customerId", record.CustomerID,
 				"error", err)
+			c.deadletter(ctx, msg, record.CampaignID, "send_notification_failed: "+err.Error())
 			continue
 		}
 

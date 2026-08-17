@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -22,23 +23,39 @@ type CampaignState struct {
 // Registry keeps an in-memory map of CampaignState entries backed by Redis
 // so that audience partitions can race against the command consumer.
 type Registry struct {
-	mu          sync.RWMutex
-	states      map[string]*CampaignState
-	redisClient *redis.Client
+	mu           sync.RWMutex
+	states       map[string]*CampaignState
+	seenMessages map[string]bool
+	redisClient  *redis.Client
 }
 
 func New(redisAddr string) *Registry {
 	return &Registry{
-		states:      make(map[string]*CampaignState),
-		redisClient: redis.NewClient(&redis.Options{Addr: redisAddr}),
+		states:       make(map[string]*CampaignState),
+		seenMessages: make(map[string]bool),
+		redisClient:  redis.NewClient(&redis.Options{Addr: redisAddr}),
 	}
 }
 
 // Register writes state to the in-memory map first, then to Redis.
 // TTL is set to (hardStopAt - now) + 5 min so Redis auto-expires stale entries.
+// Idempotent on messageId: a redelivered command with a messageId already
+// seen for its campaignId is logged and skipped rather than overwriting
+// the existing state, per the architecture doc's requirement that
+// Register be idempotent on messageId.
 func (reg *Registry) Register(ctx context.Context, state *CampaignState) error {
+	dedupKey := state.CampaignID + ":" + state.MessageID
+
 	reg.mu.Lock()
+	if reg.seenMessages[dedupKey] {
+		reg.mu.Unlock()
+		slog.Info("registry: duplicate command, skipping",
+			"campaignId", state.CampaignID,
+			"messageId", state.MessageID)
+		return nil
+	}
 	reg.states[state.CampaignID] = state
+	reg.seenMessages[dedupKey] = true
 	reg.mu.Unlock()
 
 	stateBytes, err := json.Marshal(state)

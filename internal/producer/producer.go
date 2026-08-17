@@ -35,6 +35,7 @@ func newWriter(brokers []string, topic string) *kafka.Writer {
 		Topic:                  topic,
 		RequiredAcks:           kafka.RequireAll,
 		AllowAutoTopicCreation: false,
+		BatchTimeout:           10 * time.Millisecond,
 	}
 }
 
