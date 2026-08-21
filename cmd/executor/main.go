@@ -32,7 +32,7 @@ func main() {
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 
 	reg := registry.New(cfg.RedisAddr)
-	prod := producer.New(brokers, cfg.KafkaOutboundTopic, cfg.KafkaDeadletterTopic)
+	prod := producer.New(brokers, cfg.KafkaOutboundTopic, cfg.KafkaDeadletterTopic, cfg.KafkaCompletedTopic)
 
 	cmdConsumer := command.New(brokers, cfg.KafkaExecuteTopic, reg)
 	grace := time.Duration(cfg.AudienceGracePeriodSeconds) * time.Second

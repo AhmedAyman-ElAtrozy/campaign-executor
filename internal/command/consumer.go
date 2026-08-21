@@ -17,10 +17,11 @@ import (
 // ExecuteCommand is a campaign window command as received on the
 // campaign-executor.execute topic.
 type ExecuteCommand struct {
-	CampaignID string    `json:"campaignId"`
-	MessageID  string    `json:"messageId"`
-	ExecuteAt  time.Time `json:"executeAt"`
-	HardStopAt time.Time `json:"hardStopAt"`
+	CampaignID string         `json:"campaignId"`
+	MessageID  string         `json:"messageId"`
+	ExecuteAt  time.Time      `json:"executeAt"`
+	HardStopAt time.Time      `json:"hardStopAt"`
+	Channels   map[string]int `json:"channels"`
 }
 
 // Consumer reads ExecuteCommand messages from Kafka and registers the
@@ -69,10 +70,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 
 		state := &registry.CampaignState{
-			CampaignID: cmd.CampaignID,
-			MessageID:  cmd.MessageID,
-			ExecuteAt:  cmd.ExecuteAt,
-			HardStopAt: cmd.HardStopAt,
+			CampaignID:       cmd.CampaignID,
+			MessageID:        cmd.MessageID,
+			ExecuteAt:        cmd.ExecuteAt,
+			HardStopAt:       cmd.HardStopAt,
+			ChannelRemaining: cmd.Channels,
 		}
 
 		if err := c.reg.Register(ctx, state); err != nil {

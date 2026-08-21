@@ -11,13 +11,20 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// channelPriority is the fixed internal order in which channels are
+// considered for quota assignment.
+var channelPriority = []string{"sms", "whatsapp", "email"}
+
 // CampaignState holds the fields from an ExecuteCommand that audience
 // consumers need before they can process records for a campaign.
 type CampaignState struct {
-	CampaignID string    `json:"campaignId"`
-	MessageID  string    `json:"messageId"`
-	ExecuteAt  time.Time `json:"executeAt"`
-	HardStopAt time.Time `json:"hardStopAt"`
+	CampaignID       string         `json:"campaignId"`
+	MessageID        string         `json:"messageId"`
+	ExecuteAt        time.Time      `json:"executeAt"`
+	HardStopAt       time.Time      `json:"hardStopAt"`
+	ChannelRemaining map[string]int `json:"channelRemaining"`
+	Processed        int            `json:"processed"`
+	TotalCount       int            `json:"totalCount"`
 }
 
 // Registry keeps an in-memory map of CampaignState entries backed by Redis
@@ -112,6 +119,72 @@ func (reg *Registry) WaitFor(ctx context.Context, campaignID string, grace time.
 		case <-ticker.C:
 		}
 	}
+}
+
+// AssignChannel picks the next available channel for a customer reachable
+// via the given contact methods, in fixed priority order (sms, whatsapp,
+// email), decrementing that channel's remaining quota. It returns
+// ("", false) if no eligible channel has quota left.
+func (reg *Registry) AssignChannel(campaignID string, hasPhone, hasEmail bool) (string, bool) {
+	var candidates []string
+	if hasPhone {
+		candidates = append(candidates, "sms", "whatsapp")
+	}
+	if hasEmail {
+		candidates = append(candidates, "email")
+	}
+
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	state := reg.states[campaignID]
+	if state == nil {
+		return "", false
+	}
+
+	for _, want := range channelPriority {
+		for _, candidate := range candidates {
+			if candidate != want {
+				continue
+			}
+			if state.ChannelRemaining[candidate] > 0 {
+				state.ChannelRemaining[candidate]--
+				return candidate, true
+			}
+		}
+	}
+	return "", false
+}
+
+// SetTotalCount records the total audience size for a campaign, as learned
+// from an END_OF_AUDIENCE record, so RecordOutcome can detect completion.
+// It also reports whether the campaign is already complete at this moment
+// (i.e. every record was already processed before the total was known).
+func (reg *Registry) SetTotalCount(campaignID string, totalCount int) bool {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	state := reg.states[campaignID]
+	if state == nil {
+		return false
+	}
+	state.TotalCount = totalCount
+	return state.TotalCount != 0 && state.Processed == state.TotalCount
+}
+
+// RecordOutcome increments the processed count for a campaign and reports
+// whether this call caused it to reach a previously-set TotalCount. It
+// returns false if TotalCount is not yet known (zero).
+func (reg *Registry) RecordOutcome(campaignID string) bool {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	state := reg.states[campaignID]
+	if state == nil {
+		return false
+	}
+	state.Processed++
+	return state.TotalCount != 0 && state.Processed == state.TotalCount
 }
 
 func redisKey(campaignID string) string {

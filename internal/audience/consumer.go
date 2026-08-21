@@ -79,8 +79,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 
 		if record.EventType == "END_OF_AUDIENCE" {
+			finished := c.reg.SetTotalCount(record.CampaignID, record.TotalCount)
 			slog.Info("audience: end of audience",
 				"campaignId", record.CampaignID)
+			if finished {
+				c.sendCampaignCompleted(ctx, record.CampaignID)
+			}
 			continue
 		}
 
@@ -97,6 +101,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 			slog.Info("audience: skipped past hard stop",
 				"campaignId", record.CampaignID,
 				"customerId", record.CustomerID)
+			c.recordOutcome(ctx, record.CampaignID)
 			continue
 		}
 
@@ -111,9 +116,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 			TotalCount: record.TotalCount,
 		}
 
-		req, err := processor.Process(procRecord, state.HardStopAt)
+		req, err := processor.Process(procRecord, state.HardStopAt, func(hasPhone, hasEmail bool) (string, bool) {
+			return c.reg.AssignChannel(record.CampaignID, hasPhone, hasEmail)
+		})
 		if err != nil {
 			c.deadletter(msg, record.CampaignID, err.Error())
+			c.recordOutcome(ctx, record.CampaignID)
 			continue
 		}
 
@@ -129,6 +137,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 				"customerId", record.CustomerID,
 				"error", err)
 			c.deadletter(msg, record.CampaignID, "send_notification_failed: "+err.Error())
+			c.recordOutcome(ctx, record.CampaignID)
 			continue
 		}
 
@@ -136,7 +145,52 @@ func (c *Consumer) Run(ctx context.Context) error {
 		slog.Info("audience: notification sent",
 			"campaignId", record.CampaignID,
 			"customerId", record.CustomerID)
+		c.recordOutcome(ctx, record.CampaignID)
 	}
+}
+
+// recordOutcome tells the registry one more record has been processed for
+// campaignID and, if that completes the campaign, sends a CampaignCompleted
+// message.
+func (c *Consumer) recordOutcome(ctx context.Context, campaignID string) {
+	if !c.reg.RecordOutcome(campaignID) {
+		return
+	}
+	c.sendCampaignCompleted(ctx, campaignID)
+}
+
+// sendCampaignCompleted looks up campaignID's current state and sends a
+// CampaignCompleted message for it, using an independent, short-lived
+// context so this last-chance write can still complete even if shutdown
+// has already cancelled ctx.
+func (c *Consumer) sendCampaignCompleted(ctx context.Context, campaignID string) {
+	state, err := c.reg.WaitFor(ctx, campaignID, c.grace)
+	if err != nil {
+		slog.Error("audience: lookup state for campaign completed failed",
+			"campaignId", campaignID,
+			"error", err)
+		return
+	}
+
+	sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cc := producer.CampaignCompleted{
+		CampaignID:  campaignID,
+		Reason:      "audience_exhausted",
+		Processed:   state.Processed,
+		TotalCount:  state.TotalCount,
+		CompletedAt: time.Now(),
+	}
+	if err := c.prod.SendCampaignCompleted(sendCtx, cc); err != nil {
+		slog.Error("audience: send campaign completed failed",
+			"campaignId", campaignID,
+			"error", err)
+		return
+	}
+	slog.Info("audience: campaign completed",
+		"campaignId", campaignID,
+		"processed", cc.Processed,
+		"totalCount", cc.TotalCount)
 }
 
 // deadletter builds and sends a DeadLetter for a record that failed
