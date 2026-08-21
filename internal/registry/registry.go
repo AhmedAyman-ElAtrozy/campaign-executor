@@ -25,6 +25,7 @@ type CampaignState struct {
 	ChannelRemaining map[string]int `json:"channelRemaining"`
 	Processed        int            `json:"processed"`
 	TotalCount       int            `json:"totalCount"`
+	Completed        bool           `json:"completed"`
 }
 
 // Registry keeps an in-memory map of CampaignState entries backed by Redis
@@ -70,12 +71,7 @@ func (reg *Registry) Register(ctx context.Context, state *CampaignState) error {
 		return fmt.Errorf("registry: marshal state for %s: %w", state.CampaignID, err)
 	}
 
-	ttl := time.Until(state.HardStopAt) + 5*time.Minute
-	if ttl <= 0 {
-		ttl = 5 * time.Minute
-	}
-
-	if err := reg.redisClient.Set(ctx, redisKey(state.CampaignID), stateBytes, ttl).Err(); err != nil {
+	if err := reg.redisClient.Set(ctx, redisKey(state.CampaignID), stateBytes, ttlFor(state.HardStopAt)).Err(); err != nil {
 		return fmt.Errorf("registry: redis set %s: %w", state.CampaignID, err)
 	}
 	return nil
@@ -149,6 +145,7 @@ func (reg *Registry) AssignChannel(campaignID string, hasPhone, hasEmail bool) (
 			}
 			if state.ChannelRemaining[candidate] > 0 {
 				state.ChannelRemaining[candidate]--
+				reg.persistToRedis(state)
 				return candidate, true
 			}
 		}
@@ -169,7 +166,9 @@ func (reg *Registry) SetTotalCount(campaignID string, totalCount int) bool {
 		return false
 	}
 	state.TotalCount = totalCount
-	return state.TotalCount != 0 && state.Processed == state.TotalCount
+	finished := checkCompleted(state)
+	reg.persistToRedis(state)
+	return finished
 }
 
 // RecordOutcome increments the processed count for a campaign and reports
@@ -184,7 +183,68 @@ func (reg *Registry) RecordOutcome(campaignID string) bool {
 		return false
 	}
 	state.Processed++
-	return state.TotalCount != 0 && state.Processed == state.TotalCount
+	finished := checkCompleted(state)
+	reg.persistToRedis(state)
+	return finished
+}
+
+// checkCompleted reports whether state has just reached completion
+// (Processed equals a known, nonzero TotalCount), marking state.Completed
+// if so. Callers must hold reg.mu.
+func checkCompleted(state *CampaignState) bool {
+	if state.TotalCount != 0 && state.Processed == state.TotalCount {
+		state.Completed = true
+		return true
+	}
+	return false
+}
+
+// IsCompleted safely reports whether campaignID has been marked complete,
+// returning false if the campaign isn't found.
+func (reg *Registry) IsCompleted(campaignID string) bool {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+
+	state := reg.states[campaignID]
+	if state == nil {
+		return false
+	}
+	return state.Completed
+}
+
+// ttlFor computes the Redis TTL for a campaign's state: time remaining
+// until hardStopAt plus a 5 minute buffer, so entries auto-expire shortly
+// after their campaign window closes.
+func ttlFor(hardStopAt time.Time) time.Duration {
+	ttl := time.Until(hardStopAt) + 5*time.Minute
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	return ttl
+}
+
+// persistToRedis marshals state and writes it to Redis under
+// redisKey(state.CampaignID), reusing the same TTL logic as Register. It
+// uses a short-lived background context so a slow or unavailable Redis
+// can't block audience processing; failures are logged, not returned,
+// matching the rest of this package's tolerance for Redis outages -- the
+// in-memory map stays authoritative regardless. Callers must hold reg.mu.
+func (reg *Registry) persistToRedis(state *CampaignState) {
+	stateBytes, err := json.Marshal(state)
+	if err != nil {
+		slog.Error("registry: marshal state for redis persist failed",
+			"campaignId", state.CampaignID,
+			"error", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := reg.redisClient.Set(ctx, redisKey(state.CampaignID), stateBytes, ttlFor(state.HardStopAt)).Err(); err != nil {
+		slog.Error("registry: redis persist failed",
+			"campaignId", state.CampaignID,
+			"error", err)
+	}
 }
 
 func redisKey(campaignID string) string {

@@ -96,6 +96,14 @@ func (c *Consumer) Run(ctx context.Context) error {
 			continue
 		}
 
+		// A campaign stops accepting audience records the moment its full
+		// audience count has been processed, even if more records for it
+		// arrive afterward (e.g. late or redelivered messages).
+		if c.reg.IsCompleted(record.CampaignID) {
+			c.deadletter(msg, record.CampaignID, "campaign_already_completed")
+			continue
+		}
+
 		if time.Now().After(state.HardStopAt) {
 			metrics.RecordsProcessed.WithLabelValues("skipped").Inc()
 			slog.Info("audience: skipped past hard stop",

@@ -10,17 +10,28 @@ const schemaRegistry = new SchemaRegistry();
 
 export const options = {
   vus: 10,
-  iterations: 2000,
+  iterations: 11000,
 };
 
 export default function () {
-  const customerId = `cust_sdfinal2_${__VU}_${__ITER}`;
+  const i = __ITER;
+  let msisdn = "";
+  let email = "";
+
+  if (i < 8000) {
+    msisdn = `+2010${String(10000000 + i).padStart(8, '0')}`;
+  } else if (i < 10000) {
+    email = `demo_${i}@example.com`;
+  }
+  // else (i >= 10000): no contact at all -> deadletter
+
+  const customerId = `cust_scale_final_${i}`;
   const message = {
     eventType: "AUDIENCE_RECORD",
-    campaignId: "cmp_sdfinal2",
+    campaignId: "cmp_scale_test_final",
     customerId: customerId,
-    msisdn: "+201012345678",
-    email: "shutdown@example.com",
+    msisdn: msisdn,
+    email: email,
     language: "ar-EG",
     attributes: {}
   };
@@ -28,7 +39,7 @@ export default function () {
   producer.produce({
     messages: [
       {
-        key: schemaRegistry.serialize({ data: customerId, schemaType: SCHEMA_TYPE_STRING }),
+        key: schemaRegistry.serialize({ data: "cmp_scale_test_final", schemaType: SCHEMA_TYPE_STRING }),
         value: schemaRegistry.serialize({ data: JSON.stringify(message), schemaType: SCHEMA_TYPE_STRING }),
       },
     ],
