@@ -23,12 +23,11 @@ export default function () {
   } else if (i < 10000) {
     email = `demo_${i}@example.com`;
   }
-  // else (i >= 10000): no contact at all -> deadletter
 
-  const customerId = `cust_scale_final_${i}`;
+  const customerId = `cust_poll_fix_${i}`;
   const message = {
     eventType: "AUDIENCE_RECORD",
-    campaignId: "cmp_scale_test_final",
+    campaignId: "cmp_poll_fix",
     customerId: customerId,
     msisdn: msisdn,
     email: email,
@@ -39,7 +38,7 @@ export default function () {
   producer.produce({
     messages: [
       {
-        key: schemaRegistry.serialize({ data: "cmp_scale_test_final", schemaType: SCHEMA_TYPE_STRING }),
+        key: schemaRegistry.serialize({ data: "cmp_poll_fix", schemaType: SCHEMA_TYPE_STRING }),
         value: schemaRegistry.serialize({ data: JSON.stringify(message), schemaType: SCHEMA_TYPE_STRING }),
       },
     ],

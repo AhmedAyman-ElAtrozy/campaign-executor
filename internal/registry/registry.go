@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sync"
 	"time"
 
@@ -35,6 +36,9 @@ type Registry struct {
 	states       map[string]*CampaignState
 	seenMessages map[string]bool
 	redisClient  *redis.Client
+
+	writerMu    sync.Mutex
+	writerChans map[string]chan CampaignState
 }
 
 func New(redisAddr string) *Registry {
@@ -42,6 +46,7 @@ func New(redisAddr string) *Registry {
 		states:       make(map[string]*CampaignState),
 		seenMessages: make(map[string]bool),
 		redisClient:  redis.NewClient(&redis.Options{Addr: redisAddr}),
+		writerChans:  make(map[string]chan CampaignState),
 	}
 }
 
@@ -131,10 +136,10 @@ func (reg *Registry) AssignChannel(campaignID string, hasPhone, hasEmail bool) (
 	}
 
 	reg.mu.Lock()
-	defer reg.mu.Unlock()
 
 	state := reg.states[campaignID]
 	if state == nil {
+		reg.mu.Unlock()
 		return "", false
 	}
 
@@ -145,30 +150,71 @@ func (reg *Registry) AssignChannel(campaignID string, hasPhone, hasEmail bool) (
 			}
 			if state.ChannelRemaining[candidate] > 0 {
 				state.ChannelRemaining[candidate]--
-				reg.persistToRedis(state)
+				snapshot := snapshotState(state)
+				reg.mu.Unlock()
+				reg.persistToRedis(snapshot)
 				return candidate, true
 			}
 		}
 	}
+	reg.mu.Unlock()
 	return "", false
 }
 
 // SetTotalCount records the total audience size for a campaign, as learned
 // from an END_OF_AUDIENCE record, so RecordOutcome can detect completion.
-// It also reports whether the campaign is already complete at this moment
-// (i.e. every record was already processed before the total was known).
+// It also reports whether the campaign is (or becomes) complete.
+//
+// Processed is incremented concurrently by the audience consumer as it
+// works through records still in flight, so a single check at the moment
+// SetTotalCount is called can race a record that's mid-processing and
+// wrongly report not-yet-complete. To avoid requiring the caller to
+// resend END_OF_AUDIENCE just to get a correct answer, SetTotalCount
+// polls for up to 5 seconds, rechecking every 100ms, and returns true as
+// soon as Processed reaches TotalCount within that window.
 func (reg *Registry) SetTotalCount(campaignID string, totalCount int) bool {
 	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
 	state := reg.states[campaignID]
 	if state == nil {
+		reg.mu.Unlock()
 		return false
 	}
 	state.TotalCount = totalCount
 	finished := checkCompleted(state)
-	reg.persistToRedis(state)
-	return finished
+	snapshot := snapshotState(state)
+	reg.mu.Unlock()
+
+	reg.persistToRedis(snapshot)
+	if finished {
+		return true
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		reg.mu.Lock()
+		state := reg.states[campaignID]
+		if state == nil {
+			reg.mu.Unlock()
+			return false
+		}
+		finished = checkCompleted(state)
+		if finished {
+			snapshot = snapshotState(state)
+		}
+		reg.mu.Unlock()
+
+		if finished {
+			reg.persistToRedis(snapshot)
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+	return false
 }
 
 // RecordOutcome increments the processed count for a campaign and reports
@@ -176,15 +222,18 @@ func (reg *Registry) SetTotalCount(campaignID string, totalCount int) bool {
 // returns false if TotalCount is not yet known (zero).
 func (reg *Registry) RecordOutcome(campaignID string) bool {
 	reg.mu.Lock()
-	defer reg.mu.Unlock()
 
 	state := reg.states[campaignID]
 	if state == nil {
+		reg.mu.Unlock()
 		return false
 	}
 	state.Processed++
 	finished := checkCompleted(state)
-	reg.persistToRedis(state)
+	snapshot := snapshotState(state)
+	reg.mu.Unlock()
+
+	reg.persistToRedis(snapshot)
 	return finished
 }
 
@@ -223,13 +272,80 @@ func ttlFor(hardStopAt time.Time) time.Duration {
 	return ttl
 }
 
-// persistToRedis marshals state and writes it to Redis under
-// redisKey(state.CampaignID), reusing the same TTL logic as Register. It
-// uses a short-lived background context so a slow or unavailable Redis
-// can't block audience processing; failures are logged, not returned,
-// matching the rest of this package's tolerance for Redis outages -- the
-// in-memory map stays authoritative regardless. Callers must hold reg.mu.
-func (reg *Registry) persistToRedis(state *CampaignState) {
+// snapshotState returns a deep copy of state's persistence-relevant
+// fields, safe to read after reg.mu is released: a later mutation of the
+// live state won't be reflected in a snapshot already captured.
+func snapshotState(state *CampaignState) CampaignState {
+	channelRemaining := make(map[string]int, len(state.ChannelRemaining))
+	maps.Copy(channelRemaining, state.ChannelRemaining)
+	snapshot := *state
+	snapshot.ChannelRemaining = channelRemaining
+	return snapshot
+}
+
+// writerBufferSize bounds how many pending writes a campaign's writer
+// channel holds before persistToRedis would start blocking its caller.
+// Audience records within a partition are processed sequentially (per
+// CLAUDE.md), so this only needs enough headroom to absorb a burst while
+// the writer catches up on a slow Redis.
+const writerBufferSize = 256
+
+// persistToRedis enqueues state to be written to Redis by campaignID's
+// background writer goroutine, so the caller (audience processing) never
+// blocks on the Redis round-trip. Enqueueing is a synchronous, buffered
+// channel send from the caller's own goroutine, which is what keeps
+// writes for one campaign in order: callers already invoke this
+// sequentially per campaign (per CLAUDE.md, partitions process audience
+// records one at a time), so sends land on the channel in the same order
+// the mutations happened, and the single per-campaign worker performs
+// the actual Redis SET calls strictly in that order. state is expected
+// to be a snapshot (see snapshotState), so this may be called without
+// reg.mu held.
+func (reg *Registry) persistToRedis(state CampaignState) {
+	reg.campaignWriter(state.CampaignID) <- state
+}
+
+// campaignWriter returns the buffered channel that queues Redis writes
+// for campaignID, lazily starting its background worker goroutine the
+// first time this campaign is seen.
+//
+// The worker goroutine and its channel are never torn down; they persist
+// for the process lifetime. This mirrors reg.states and reg.seenMessages,
+// which already accumulate one entry per campaignID for the process's
+// life with no eviction -- the number of distinct campaign IDs a process
+// handles over its lifetime is bounded by the campaigns it actually
+// executes, not by audience volume, so this is not an unbounded leak in
+// the way a per-record goroutine would be.
+func (reg *Registry) campaignWriter(campaignID string) chan CampaignState {
+	reg.writerMu.Lock()
+	defer reg.writerMu.Unlock()
+
+	if ch, ok := reg.writerChans[campaignID]; ok {
+		return ch
+	}
+
+	ch := make(chan CampaignState, writerBufferSize)
+	reg.writerChans[campaignID] = ch
+	go reg.runCampaignWriter(ch)
+	return ch
+}
+
+// runCampaignWriter drains ch and writes each snapshot to Redis one at a
+// time, in the order it was enqueued.
+func (reg *Registry) runCampaignWriter(ch chan CampaignState) {
+	for state := range ch {
+		reg.writeToRedis(state)
+	}
+}
+
+// writeToRedis marshals state and writes it to Redis under
+// redisKey(state.CampaignID), reusing the same TTL logic as Register,
+// using a fresh short-lived context per write so a slow or unavailable
+// Redis can't stall the writer indefinitely. Failures are logged, not
+// returned -- there is no caller to return them to, and this matches the
+// rest of this package's tolerance for Redis outages: the in-memory map
+// stays authoritative regardless.
+func (reg *Registry) writeToRedis(state CampaignState) {
 	stateBytes, err := json.Marshal(state)
 	if err != nil {
 		slog.Error("registry: marshal state for redis persist failed",
