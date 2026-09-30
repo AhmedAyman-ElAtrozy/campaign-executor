@@ -39,19 +39,29 @@ type NotificationRequest struct {
 	Language       string         `json:"language"`
 	Attributes     map[string]any `json:"attributes"`
 	NotAfter       time.Time      `json:"notAfter"`
+	Channel        string         `json:"channel"`
 }
 
 // Process validates one AudienceRecord and builds the outbound
 // NotificationRequest. Pure function: no Kafka, no Redis, no I/O.
-func Process(record AudienceRecord, hardStopAt time.Time) (*NotificationRequest, error) {
+// assignChannel is called last, after all other validation passes, to
+// assign a channel under the campaign's quota; if it reports ok=false
+// the record is rejected with "quota_exhausted".
+func Process(record AudienceRecord, hardStopAt time.Time, assignChannel func(hasPhone, hasEmail bool) (string, bool)) (*NotificationRequest, error) {
 	// Reject customers we have no way to reach at all.
 	if record.MSISDN == "" && record.Email == "" {
 		return nil, fmt.Errorf("processor: customer %s has no contact: msisdn or email required", record.CustomerID)
 	}
 	// If a phone number was given, it must be a valid Egyptian mobile number.
 	if record.MSISDN != "" && !e164EG.MatchString(record.MSISDN) {
-		return nil, fmt.Errorf("processor: msisdn %q for customer %s is not valid E.164", record.MSISDN, record.CustomerID)
+		return nil, fmt.Errorf("processor: msisdn %q for customer %s is not valid Egyptian number", record.MSISDN, record.CustomerID)
 	}
+
+	channel, ok := assignChannel(record.MSISDN != "", record.Email != "")
+	if !ok {
+		return nil, fmt.Errorf("quota_exhausted")
+	}
+
 	return &NotificationRequest{
 		IdempotencyKey: buildIdempotencyKey(record.CampaignID, record.CustomerID),
 		CampaignID:     record.CampaignID,
@@ -60,6 +70,7 @@ func Process(record AudienceRecord, hardStopAt time.Time) (*NotificationRequest,
 		Language:       record.Language,
 		Attributes:     record.Attributes,
 		NotAfter:       hardStopAt,
+		Channel:        channel,
 	}, nil
 }
 

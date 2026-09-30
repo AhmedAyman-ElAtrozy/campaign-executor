@@ -11,6 +11,7 @@ type Config struct {
 	KafkaAudienceTopic         string
 	KafkaOutboundTopic         string
 	KafkaDeadletterTopic       string
+	KafkaCompletedTopic        string
 	RedisAddr                  string
 	HTTPPort                   string
 	AudienceGracePeriodSeconds int
@@ -23,6 +24,7 @@ func Load() (*Config, error) {
 		KafkaAudienceTopic:   getEnv("KAFKA_AUDIENCE_TOPIC", "campaign.audience"),
 		KafkaOutboundTopic:   getEnv("KAFKA_OUTBOUND_TOPIC", "notifications.outbound"),
 		KafkaDeadletterTopic: getEnv("KAFKA_DEADLETTER_TOPIC", "campaign.deadletter"),
+		KafkaCompletedTopic:  getEnv("KAFKA_COMPLETED_TOPIC", "campaign.completed"),
 		RedisAddr:            getEnv("REDIS_ADDR", "localhost:6379"),
 		HTTPPort:             getEnv("HTTP_PORT", "8080"),
 	}

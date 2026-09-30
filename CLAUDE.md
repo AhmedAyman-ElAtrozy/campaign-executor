@@ -44,15 +44,19 @@ test/synthetic/ — fake Scheduler + Customer Manager
 
 ## JSON contracts (exact field names — do not deviate)
 
-ExecuteCommand: campaignId, messageId, executeAt, hardStopAt
+ExecuteCommand: campaignId, messageId, executeAt, hardStopAt,
+channels (map of channel name to quota int; absent or empty
+means zero quota for every channel — never defaulted)
 AudienceRecord: eventType, campaignId, customerId, msisdn,
 email, language, attributes, totalCount
 NotificationRequest: idempotencyKey, campaignId, customerId,
 contact{msisdn,email}, language, attributes,
-notAfter
+notAfter, channel
 DeadLetter: campaignId, originalTopic, originalPartition,
 originalOffset, lastError, attempts, failedAt,
 snapshot
+CampaignCompleted (topic campaign.completed): campaignId, reason,
+processed, totalCount, completedAt
 
 ## Before writing code in any file
 

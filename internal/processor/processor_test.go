@@ -55,7 +55,9 @@ func TestProcess(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := Process(tc.record, hardStop)
+			result, err := Process(tc.record, hardStop, func(hasPhone, hasEmail bool) (string, bool) {
+				return "sms", true
+			})
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")
@@ -76,6 +78,25 @@ func TestProcess(t *testing.T) {
 					t.Error("attributes not passed through unchanged")
 				}
 			}
+			if result.Channel != "sms" {
+				t.Errorf("channel = %q, want %q", result.Channel, "sms")
+			}
 		})
+	}
+}
+
+func TestProcess_QuotaExhausted(t *testing.T) {
+	hardStop := time.Now().Add(time.Hour)
+	record := AudienceRecord{
+		CampaignID: "camp-1",
+		CustomerID: "cust-1",
+		MSISDN:     "+15551234567",
+	}
+
+	_, err := Process(record, hardStop, func(hasPhone, hasEmail bool) (string, bool) {
+		return "", false
+	})
+	if err == nil {
+		t.Fatal("expected error when no channel has quota, got nil")
 	}
 }

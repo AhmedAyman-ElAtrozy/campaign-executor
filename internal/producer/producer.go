@@ -16,14 +16,16 @@ import (
 type Producer struct {
 	outbound   *kafka.Writer
 	deadletter *kafka.Writer
+	completed  *kafka.Writer
 }
 
 // New builds a Producer with fully-acked writers for the
-// given outbound and deadletter topics.
-func New(brokers []string, outboundTopic, deadletterTopic string) *Producer {
+// given outbound, deadletter, and completed topics.
+func New(brokers []string, outboundTopic, deadletterTopic, completedTopic string) *Producer {
 	return &Producer{
 		outbound:   newWriter(brokers, outboundTopic),
 		deadletter: newWriter(brokers, deadletterTopic),
+		completed:  newWriter(brokers, completedTopic),
 	}
 }
 
@@ -35,6 +37,7 @@ func newWriter(brokers []string, topic string) *kafka.Writer {
 		Topic:                  topic,
 		RequiredAcks:           kafka.RequireAll,
 		AllowAutoTopicCreation: false,
+		BatchTimeout:           10 * time.Millisecond,
 	}
 }
 
@@ -49,6 +52,16 @@ type DeadLetter struct {
 	Attempts          int       `json:"attempts"`
 	FailedAt          time.Time `json:"failedAt"`
 	Snapshot          []byte    `json:"snapshot"`
+}
+
+// CampaignCompleted mirrors the campaign.completed JSON contract, sent
+// once a campaign's processed record count reaches its total audience size.
+type CampaignCompleted struct {
+	CampaignID  string    `json:"campaignId"`
+	Reason      string    `json:"reason"`
+	Processed   int       `json:"processed"`
+	TotalCount  int       `json:"totalCount"`
+	CompletedAt time.Time `json:"completedAt"`
 }
 
 // SendNotification marshals a NotificationRequest to JSON and writes it
@@ -83,13 +96,32 @@ func (p *Producer) SendDeadLetter(ctx context.Context, dl DeadLetter) error {
 	return nil
 }
 
-// Close shuts down both the outbound and deadletter Kafka writers.
+// SendCampaignCompleted marshals a CampaignCompleted to JSON and writes it
+// to the completed topic, keyed by campaign ID.
+func (p *Producer) SendCampaignCompleted(ctx context.Context, cc CampaignCompleted) error {
+	value, err := json.Marshal(cc)
+	if err != nil {
+		return fmt.Errorf("producer: marshal campaign completed for campaign %s: %w", cc.CampaignID, err)
+	}
+	if err := p.completed.WriteMessages(ctx, kafka.Message{
+		Key:   []byte(cc.CampaignID),
+		Value: value,
+	}); err != nil {
+		return fmt.Errorf("producer: write campaign completed for campaign %s: %w", cc.CampaignID, err)
+	}
+	return nil
+}
+
+// Close shuts down the outbound, deadletter, and completed Kafka writers.
 func (p *Producer) Close() error {
 	if err := p.outbound.Close(); err != nil {
 		return fmt.Errorf("producer: close outbound writer: %w", err)
 	}
 	if err := p.deadletter.Close(); err != nil {
 		return fmt.Errorf("producer: close deadletter writer: %w", err)
+	}
+	if err := p.completed.Close(); err != nil {
+		return fmt.Errorf("producer: close completed writer: %w", err)
 	}
 	return nil
 }

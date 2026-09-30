@@ -24,10 +24,11 @@ func TestFullFlow(t *testing.T) {
 	// Step 2: register a fake CampaignState with hardStopAt one hour out.
 	hardStopAt := time.Now().Add(time.Hour)
 	state := &registry.CampaignState{
-		CampaignID: "cmp_test_999",
-		MessageID:  "msg_test_999",
-		ExecuteAt:  time.Now(),
-		HardStopAt: hardStopAt,
+		CampaignID:       "cmp_test_999",
+		MessageID:        "msg_test_999",
+		ExecuteAt:        time.Now(),
+		HardStopAt:       hardStopAt,
+		ChannelRemaining: map[string]int{"sms": 1, "whatsapp": 1, "email": 1},
 	}
 	if err := reg.Register(ctx, state); err != nil {
 		t.Fatalf("registry.Register failed: %v", err)
@@ -59,7 +60,9 @@ func TestFullFlow(t *testing.T) {
 	}
 	t.Logf("step 4a: built audience record: %+v", record)
 
-	notification, err := processor.Process(record, found.HardStopAt)
+	notification, err := processor.Process(record, found.HardStopAt, func(hasPhone, hasEmail bool) (string, bool) {
+		return reg.AssignChannel("cmp_test_999", hasPhone, hasEmail)
+	})
 	if err != nil {
 		t.Fatalf("processor.Process failed: %v", err)
 	}
@@ -70,7 +73,7 @@ func TestFullFlow(t *testing.T) {
 	t.Logf("step 4b: processed notification request:\n%s", notificationJSON)
 
 	// Step 5: producer pointed at local Kafka, send the notification.
-	p := producer.New([]string{"localhost:9092"}, "notifications.outbound", "campaign.deadletter")
+	p := producer.New([]string{"localhost:9092"}, "notifications.outbound", "campaign.deadletter", "campaign.completed")
 	defer p.Close()
 	t.Log("step 5a: created producer pointed at localhost:9092")
 
@@ -78,4 +81,27 @@ func TestFullFlow(t *testing.T) {
 		t.Fatalf("producer.SendNotification failed: %v", err)
 	}
 	t.Log("step 5b: SendNotification succeeded")
+
+	// Step 6: recording the outcome should mark the campaign complete,
+	// since TotalCount is 1 and we just processed the only record.
+	reg.SetTotalCount("cmp_test_999", record.TotalCount)
+	finished := reg.RecordOutcome("cmp_test_999")
+	if !finished {
+		t.Fatal("expected RecordOutcome to report finished after processing the only audience record")
+	}
+	if !reg.IsCompleted("cmp_test_999") {
+		t.Fatal("expected IsCompleted to be true after the campaign finished")
+	}
+
+	cc := producer.CampaignCompleted{
+		CampaignID:  "cmp_test_999",
+		Reason:      "audience_exhausted",
+		Processed:   1,
+		TotalCount:  1,
+		CompletedAt: time.Now(),
+	}
+	if err := p.SendCampaignCompleted(ctx, cc); err != nil {
+		t.Fatalf("producer.SendCampaignCompleted failed: %v", err)
+	}
+	t.Log("step 6: SendCampaignCompleted succeeded")
 }

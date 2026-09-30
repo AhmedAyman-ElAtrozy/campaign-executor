@@ -1,1 +1,229 @@
+// Package audience consumes campaign.audience customer records,
+// validates and processes each one sequentially, and produces the
+// resulting notification or deadletter.
 package audience
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"time"
+
+	"campaign-executor/internal/metrics"
+	"campaign-executor/internal/processor"
+	"campaign-executor/internal/producer"
+	"campaign-executor/internal/registry"
+
+	"github.com/segmentio/kafka-go"
+)
+
+// AudienceRecord is one customer record.
+type AudienceRecord struct {
+	EventType  string         `json:"eventType"`
+	CampaignID string         `json:"campaignId"`
+	CustomerID string         `json:"customerId"`
+	MSISDN     string         `json:"msisdn"`
+	Email      string         `json:"email"`
+	Language   string         `json:"language"`
+	Attributes map[string]any `json:"attributes"`
+	TotalCount int            `json:"totalCount"`
+}
+
+// Consumer reads AudienceRecord messages from one partition, validates
+// each against its campaign window, and produces the outcome.
+type Consumer struct {
+	reader *kafka.Reader
+	reg    *registry.Registry
+	prod   *producer.Producer
+	grace  time.Duration
+}
+
+// New builds a Consumer reading topic from brokers under the
+// campaign-executor-audience consumer group, using reg to look up
+// campaign windows and prod to produce results.
+func New(brokers []string, topic string, reg *registry.Registry, prod *producer.Producer, grace time.Duration) *Consumer {
+	return &Consumer{
+		reader: kafka.NewReader(kafka.ReaderConfig{
+			Brokers: brokers,
+			Topic:   topic,
+			GroupID: "campaign-executor-audience",
+		}),
+		reg:   reg,
+		prod:  prod,
+		grace: grace,
+	}
+}
+
+// Run reads and processes audience records one at a time, in order,
+// until ctx is cancelled. A single bad or failing record is logged
+// and skipped rather than stopping the loop; ctx cancellation is a
+// clean exit.
+func (c *Consumer) Run(ctx context.Context) error {
+	defer c.reader.Close()
+
+	for {
+		msg, err := c.reader.ReadMessage(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return ctx.Err()
+			}
+			slog.Error("audience: read message failed", "error", err)
+			continue
+		}
+
+		var record AudienceRecord
+		if err := json.Unmarshal(msg.Value, &record); err != nil {
+			slog.Error("audience: unmarshal failed", "error", err)
+			continue
+		}
+
+		if record.EventType == "END_OF_AUDIENCE" {
+			finished := c.reg.SetTotalCount(record.CampaignID, record.TotalCount)
+			slog.Info("audience: end of audience",
+				"campaignId", record.CampaignID)
+			if finished {
+				c.sendCampaignCompleted(ctx, record.CampaignID)
+			}
+			continue
+		}
+
+		waitStart := time.Now()
+		state, err := c.reg.WaitFor(ctx, record.CampaignID, c.grace)
+		metrics.RegistryWaitSeconds.Observe(time.Since(waitStart).Seconds())
+		if err != nil {
+			c.deadletter(msg, record.CampaignID, "unknown_campaign")
+			continue
+		}
+
+		// A campaign stops accepting audience records the moment its full
+		// audience count has been processed, even if more records for it
+		// arrive afterward (e.g. late or redelivered messages).
+		if c.reg.IsCompleted(record.CampaignID) {
+			c.deadletter(msg, record.CampaignID, "campaign_already_completed")
+			continue
+		}
+
+		if time.Now().After(state.HardStopAt) {
+			metrics.RecordsProcessed.WithLabelValues("skipped").Inc()
+			slog.Info("audience: skipped past hard stop",
+				"campaignId", record.CampaignID,
+				"customerId", record.CustomerID)
+			c.recordOutcome(ctx, record.CampaignID)
+			continue
+		}
+
+		procRecord := processor.AudienceRecord{
+			EventType:  record.EventType,
+			CampaignID: record.CampaignID,
+			CustomerID: record.CustomerID,
+			MSISDN:     record.MSISDN,
+			Email:      record.Email,
+			Language:   record.Language,
+			Attributes: record.Attributes,
+			TotalCount: record.TotalCount,
+		}
+
+		req, err := processor.Process(procRecord, state.HardStopAt, func(hasPhone, hasEmail bool) (string, bool) {
+			return c.reg.AssignChannel(record.CampaignID, hasPhone, hasEmail)
+		})
+		if err != nil {
+			c.deadletter(msg, record.CampaignID, err.Error())
+			c.recordOutcome(ctx, record.CampaignID)
+			continue
+		}
+
+		// Use an independent, short-lived context for this last-chance write
+		// so a record that is mid-flight at shutdown can still be produced
+		// or deadlettered instead of being dropped with "context canceled".
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = c.prod.SendNotification(sendCtx, req)
+		sendCancel()
+		if err != nil {
+			slog.Error("audience: send notification failed",
+				"campaignId", record.CampaignID,
+				"customerId", record.CustomerID,
+				"error", err)
+			c.deadletter(msg, record.CampaignID, "send_notification_failed: "+err.Error())
+			c.recordOutcome(ctx, record.CampaignID)
+			continue
+		}
+
+		metrics.RecordsProcessed.WithLabelValues("ok").Inc()
+		slog.Info("audience: notification sent",
+			"campaignId", record.CampaignID,
+			"customerId", record.CustomerID)
+		c.recordOutcome(ctx, record.CampaignID)
+	}
+}
+
+// recordOutcome tells the registry one more record has been processed for
+// campaignID and, if that completes the campaign, sends a CampaignCompleted
+// message.
+func (c *Consumer) recordOutcome(ctx context.Context, campaignID string) {
+	if !c.reg.RecordOutcome(campaignID) {
+		return
+	}
+	c.sendCampaignCompleted(ctx, campaignID)
+}
+
+// sendCampaignCompleted looks up campaignID's current state and sends a
+// CampaignCompleted message for it, using an independent, short-lived
+// context so this last-chance write can still complete even if shutdown
+// has already cancelled ctx.
+func (c *Consumer) sendCampaignCompleted(ctx context.Context, campaignID string) {
+	state, err := c.reg.WaitFor(ctx, campaignID, c.grace)
+	if err != nil {
+		slog.Error("audience: lookup state for campaign completed failed",
+			"campaignId", campaignID,
+			"error", err)
+		return
+	}
+
+	sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cc := producer.CampaignCompleted{
+		CampaignID:  campaignID,
+		Reason:      "audience_exhausted",
+		Processed:   state.Processed,
+		TotalCount:  state.TotalCount,
+		CompletedAt: time.Now(),
+	}
+	if err := c.prod.SendCampaignCompleted(sendCtx, cc); err != nil {
+		slog.Error("audience: send campaign completed failed",
+			"campaignId", campaignID,
+			"error", err)
+		return
+	}
+	slog.Info("audience: campaign completed",
+		"campaignId", campaignID,
+		"processed", cc.Processed,
+		"totalCount", cc.TotalCount)
+}
+
+// deadletter builds and sends a DeadLetter for a record that failed
+// before or during processing, logging if the send itself fails. It uses
+// an independent, short-lived context (rather than Run's ctx) so this
+// last-chance write can still complete even if shutdown has already
+// cancelled the main context.
+func (c *Consumer) deadletter(msg kafka.Message, campaignID, lastError string) {
+	dl := producer.DeadLetter{
+		CampaignID:        campaignID,
+		OriginalTopic:     msg.Topic,
+		OriginalPartition: msg.Partition,
+		OriginalOffset:    msg.Offset,
+		LastError:         lastError,
+		Attempts:          1,
+		FailedAt:          time.Now(),
+		Snapshot:          msg.Value,
+	}
+	sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.prod.SendDeadLetter(sendCtx, dl); err != nil {
+		slog.Error("audience: send deadletter failed",
+			"campaignId", campaignID,
+			"error", err)
+		return
+	}
+	metrics.RecordsProcessed.WithLabelValues("deadletter").Inc()
+}
